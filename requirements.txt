@@ -4,3 +4,5 @@ numpy>=1.19.0  # Numerical operations and data handling
 
 # Utility packages
 tqdm>=4.0.0    # Progress bars for training loops
+pandas>=1.5.0  # Financial data wrangling and preprocessing
+akshare>=1.12.77  # Open-source Chinese market data interface

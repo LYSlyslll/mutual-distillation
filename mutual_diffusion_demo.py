@@ -10,12 +10,17 @@ mutual_distillation_model.py
 """
 
 import math
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
-import os
 
 # --------------------
 # 配置 / 超参数（可按需调整）
@@ -28,7 +33,7 @@ np.random.seed(SEED)
 # 超参数示例
 CONFIG = {
     "t": 20,                 # 窗口长度（时间步数）
-    "n_features": 16,        # 每步特征维度（n）
+    "n_features": 10,        # 每步特征维度（n），会在数据集加载后进行对齐
     "gru_hidden": 64,        # GRU 隐藏单元
     "gru_layers": 2,         # GRU 层数
     "gru_bidirectional": False,
@@ -42,29 +47,185 @@ CONFIG = {
     "lambda_distill": 0.5,    # 互蒸馏权重 lambda
     "alternating": False,     # 是否使用交替训练（True/False）
     "save_dir": "./checkpoints",
+    "hs300_max_symbols": 30,
+    "hs300_start_date": None,
+    "hs300_end_date": None,
+    "hs300_cache_dir": "./data",
 }
 
 os.makedirs(CONFIG["save_dir"], exist_ok=True)
 
 # --------------------
-# 简单 Dataset（示例用伪数据）
+# 沪深300成分股数据集
 # --------------------
-class DummyTimeSeriesDataset(Dataset):
-    def __init__(self, n_samples, t, n_features):
-        self.n_samples = n_samples
-        self.t = t
-        self.n_features = n_features
-        # 造一些随机数据：特征和目标（回归）
-        self.X = np.random.normal(size=(n_samples, t, n_features)).astype(np.float32)
-        # 目标：用一些可学的函数生成（例如每样本的最后时间步特征加噪）
-        self.y = (self.X.mean(axis=(1,2)) + 0.1 * np.random.randn(n_samples)).astype(np.float32)
-        self.y = self.y.reshape(-1,1)
+def _format_stock_symbol(symbol: str) -> str:
+    symbol = symbol.strip()
+    if symbol.startswith("6"):
+        return f"sh{symbol}"
+    if symbol.startswith(("0", "3")):
+        return f"sz{symbol}"
+    return symbol
+
+
+def _default_date_range(years: int = 3):
+    end = datetime.today()
+    start = end - timedelta(days=365 * years)
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+
+class HS300TimeSeriesDataset(Dataset):
+    """
+    从开源金融数据接口（akshare）抓取沪深300指数成分股日线数据，
+    构造时间序列监督学习数据集。
+    """
+
+    FEATURE_COLUMNS = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "turnover",
+        "return",
+        "volume_change",
+        "volatility",
+        "high_low_range",
+    ]
+
+    def __init__(
+        self,
+        window_size: int,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        max_symbols: int = 20,
+        cache_dir: str | os.PathLike[str] = "./data",
+    ):
+        if start_date is None or end_date is None:
+            default_start, default_end = _default_date_range(years=3)
+            start_date = start_date or default_start
+            end_date = end_date or default_end
+
+        self.window_size = window_size
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.samples = []
+        self.targets = []
+
+        data_frames = self._load_data(start_date, end_date, max_symbols)
+        self._build_samples(data_frames)
+
+        if not self.samples:
+            raise RuntimeError("HS300 数据集中没有生成任何样本，请检查时间范围或网络连接。")
+
+        self.n_features = len(self.FEATURE_COLUMNS)
+
+    def _load_data(self, start_date: str, end_date: str, max_symbols: int):
+        try:
+            import akshare as ak
+        except ImportError as exc:
+            raise ImportError(
+                "HS300TimeSeriesDataset 需要安装 akshare，请运行 `pip install akshare`。"
+            ) from exc
+
+        cache_file = self.cache_dir / f"hs300_{start_date}_{end_date}_{max_symbols}.pkl"
+        if cache_file.exists():
+            return pd.read_pickle(cache_file)
+
+        comp_df = ak.index_stock_cons(symbol="000300")
+        if "con_code" not in comp_df.columns:
+            raise RuntimeError("无法从 akshare 获取沪深300成分股列表。")
+
+        symbols = comp_df["con_code"].dropna().astype(str).head(max_symbols).tolist()
+        records = []
+
+        for code in symbols:
+            formatted = _format_stock_symbol(code)
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=formatted,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq",
+                )
+            except Exception as err:  # noqa: BLE001
+                print(f"获取 {formatted} 数据失败: {err}")
+                continue
+
+            if df.empty:
+                continue
+
+            rename_map = {
+                "日期": "date",
+                "开盘": "open",
+                "收盘": "close",
+                "最高": "high",
+                "最低": "low",
+                "成交量": "volume",
+                "成交额": "turnover",
+                "涨跌幅": "pct_change",
+                "涨跌额": "change",
+                "换手率": "turnover_rate",
+                "振幅": "amplitude",
+            }
+            df = df.rename(columns=rename_map)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").set_index("date")
+
+            numeric_cols = [
+                "open",
+                "close",
+                "high",
+                "low",
+                "volume",
+                "turnover",
+            ]
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+            df = df.dropna(subset=numeric_cols)
+
+            df["return"] = df["close"].pct_change().fillna(0.0)
+            df["volume_change"] = df["volume"].pct_change().fillna(0.0)
+            df["volatility"] = df["return"].rolling(window=5, min_periods=1).std().fillna(0.0)
+            df["high_low_range"] = ((df["high"] - df["low"]) / df["close"].replace(0, np.nan)).fillna(0.0)
+            df["target"] = df["close"].pct_change().shift(-1)
+            df["symbol"] = formatted
+
+            feature_df = df[self.FEATURE_COLUMNS + ["target", "symbol"]].dropna(subset=["target"])
+            if feature_df.empty:
+                continue
+
+            records.append(feature_df)
+
+        if not records:
+            raise RuntimeError("未能下载任何沪深300成分股数据，请检查网络或 akshare 接口。")
+
+        combined = pd.concat(records, axis=0)
+        combined.to_pickle(cache_file)
+        return combined
+
+    def _build_samples(self, combined_df: pd.DataFrame):
+        grouped = combined_df.groupby("symbol")
+        for _, df in grouped:
+            values = df[self.FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+            targets = df["target"].to_numpy(dtype=np.float32)
+            if len(values) <= self.window_size:
+                continue
+            for idx in range(self.window_size, len(values)):
+                window = values[idx - self.window_size : idx]
+                target = targets[idx]
+                if np.isnan(window).any() or np.isnan(target):
+                    continue
+                self.samples.append(window.copy())
+                self.targets.append(target)
 
     def __len__(self):
-        return self.n_samples
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        x = self.samples[idx]
+        y = np.array([self.targets[idx]], dtype=np.float32)
+        return x.astype(np.float32), y
 
 
 # --------------------
@@ -306,9 +467,28 @@ def main():
     device = DEVICE
     print("Device:", device)
 
-    # 数据集（示例）
-    train_ds = DummyTimeSeriesDataset(n_samples=5000, t=cfg["t"], n_features=cfg["n_features"])
-    val_ds = DummyTimeSeriesDataset(n_samples=1000, t=cfg["t"], n_features=cfg["n_features"])
+    dataset = HS300TimeSeriesDataset(
+        window_size=cfg["t"],
+        start_date=cfg["hs300_start_date"],
+        end_date=cfg["hs300_end_date"],
+        max_symbols=cfg["hs300_max_symbols"],
+        cache_dir=cfg["hs300_cache_dir"],
+    )
+
+    # 根据真实数据的特征维度更新配置
+    cfg["n_features"] = dataset.n_features
+
+    n_total = len(dataset)
+    n_train = int(n_total * 0.8)
+    n_val = n_total - n_train
+    if n_train == 0 or n_val == 0:
+        raise RuntimeError("数据量不足以划分训练/验证集，请扩大时间范围或放宽筛选条件。")
+
+    train_ds, val_ds = random_split(
+        dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(SEED),
+    )
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False)
@@ -349,11 +529,17 @@ def main():
             torch.save(model.state_dict(), os.path.join(cfg["save_dir"], "best_model.pt"))
             print("Saved best model.")
 
-    # 演示推理
+    # 演示推理：取验证集中一小批样本
     model.eval()
-    sample = torch.from_numpy(np.random.normal(size=(4, cfg["t"], cfg["n_features"])).astype(np.float32)).to(device)
+    try:
+        sample_batch, _ = next(iter(val_loader))
+    except StopIteration:
+        sample_batch = next(iter(train_loader))
+    sample_batch = sample_batch.to(device)
+    if sample_batch.shape[0] > 4:
+        sample_batch = sample_batch[:4]
     with torch.no_grad():
-        out = model(sample)
+        out = model(sample_batch)
     print("Demo outputs (fusion predictions):", out["y_fuse"].cpu().numpy().flatten())
 
 if __name__ == "__main__":
