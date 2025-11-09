@@ -1,0 +1,6 @@
+# Deep Learning dependencies
+torch>=2.0.0   # Core framework for neural networks
+numpy>=1.19.0  # Numerical operations and data handling
+
+# Utility packages
+tqdm>=4.0.0    # Progress bars for training loops
