@@ -140,6 +140,7 @@ class HS300TimeSeriesDataset(Dataset):
 
         self.samples = []
         self.targets = []
+        self.feature_stats = {}
 
         data_frames = self._load_data(start_date, end_date, max_symbols)
         self._build_samples(data_frames)
@@ -172,7 +173,13 @@ class HS300TimeSeriesDataset(Dataset):
         if cache_file.exists():
             print(f"Loading from cache: {cache_file}")
             bs.logout()
-            return pd.read_pickle(cache_file)
+            cached_df = pd.read_pickle(cache_file)
+            if not cached_df.attrs.get("normalized", False):
+                cached_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+                cached_df = self._normalize_features(cached_df)
+            else:
+                self.feature_stats = cached_df.attrs.get("feature_stats", {})
+            return cached_df
 
         rs = bs.query_hs300_stocks()
         if rs.error_code != '0':
@@ -247,20 +254,41 @@ class HS300TimeSeriesDataset(Dataset):
             raise RuntimeError("未能下载任何数据，请检查日期范围是否为非交易日，或网络问题。")
 
         combined = pd.concat(records, axis=0)
+        combined.replace([np.inf, -np.inf], np.nan, inplace=True)
+        combined = self._normalize_features(combined)
         combined.to_pickle(cache_file)
         return combined
+
+    def _normalize_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        对特征列做简单标准化，避免成交量、成交额等大数值导致训练时梯度爆炸。
+
+        对于出现 inf 的值直接视为缺失，在计算统计量时忽略；若标准差为 0，则退化为 1
+        以避免除零导致 NaN。
+        """
+        for col in self.FEATURE_COLUMNS:
+            series = df[col].replace([np.inf, -np.inf], np.nan)
+            mean = series.mean(skipna=True)
+            std = series.std(skipna=True)
+            if std is None or np.isnan(std) or std == 0:
+                std = 1.0
+            df[col] = (series - mean) / std
+            self.feature_stats[col] = {"mean": float(mean) if not pd.isna(mean) else 0.0, "std": float(std)}
+        df.attrs["normalized"] = True
+        df.attrs["feature_stats"] = self.feature_stats.copy()
+        return df
 
     def _build_samples(self, combined_df: pd.DataFrame):
         grouped = combined_df.groupby("symbol")
         for _, df in grouped:
             values = df[self.FEATURE_COLUMNS].to_numpy(dtype=np.float32)
-            targets = df["target"].to_numpy(dtype=np.float32)
+            targets = df["target"].replace([np.inf, -np.inf], np.nan).to_numpy(dtype=np.float32)
             if len(values) <= self.window_size:
                 continue
             for idx in range(self.window_size, len(values)):
                 window = values[idx - self.window_size : idx]
                 target = targets[idx]
-                if np.isnan(window).any() or np.isnan(target):
+                if not np.isfinite(window).all() or not np.isfinite(target):
                     continue
                 self.samples.append(window.copy())
                 self.targets.append(target)
@@ -578,15 +606,21 @@ def main():
     # 演示推理：取验证集中一小批样本
     model.eval()
     try:
-        sample_batch, _ = next(iter(val_loader))
+        sample_batch, sample_targets = next(iter(val_loader))
     except StopIteration:
-        sample_batch = next(iter(train_loader))
-    sample_batch = sample_batch.to(device)
-    if sample_batch.shape[0] > 4:
-        sample_batch = sample_batch[:4]
+        sample_batch, sample_targets = next(iter(train_loader))
+
+    sample_batch = sample_batch.to(device)[:10]
+    sample_targets = sample_targets.to(device)[:10]
+
     with torch.no_grad():
         out = model(sample_batch)
-    print("Demo outputs (fusion predictions):", out["y_fuse"].cpu().numpy().flatten())
+        preds = out["y_fuse"].flatten()
+
+    rmse_demo = torch.sqrt(torch.mean((preds - sample_targets.flatten()) ** 2)).item()
+    print("Demo ground truths (first up to 10 samples):", sample_targets.flatten().cpu().numpy())
+    print("Demo predictions (first up to 10 samples):", preds.cpu().numpy())
+    print(f"Demo RMSE on shown samples: {rmse_demo:.6f}")
 
 if __name__ == "__main__":
     main()
