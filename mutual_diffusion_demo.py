@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
+import baostock as bs
 
 # --------------------
 # 配置 / 超参数（可按需调整）
@@ -70,8 +71,36 @@ def _format_stock_symbol(symbol: str) -> str:
 def _default_date_range(years: int = 3):
     end = datetime.today()
     start = end - timedelta(days=365 * years)
-    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    # Baostock 必须使用 YYYY-MM-DD 格式
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
+# --- 新增：Baostock 专用格式化函数 ---
+def _format_baostock_symbol(symbol: str) -> str:
+    """
+    将股票代码强制转换为 Baostock 需要的 'sh.600000' 格式
+    """
+    # 1. 清理空格并转小写
+    symbol = symbol.strip().lower()
+    
+    # 2. 如果已经是 sh. 或 sz. 开头且长度为9，直接返回
+    if (symbol.startswith("sh.") or symbol.startswith("sz.")) and len(symbol) == 9:
+        return symbol
+        
+    # 3. 如果是 akshare 格式 (sh600000)，去掉前缀重新加
+    if symbol.startswith("sh") and "." not in symbol:
+        return "sh." + symbol[2:]
+    if symbol.startswith("sz") and "." not in symbol:
+        return "sz." + symbol[2:]
+        
+    # 4. 如果是纯数字 (600000)
+    if symbol.isdigit():
+        if symbol.startswith("6"):
+            return f"sh.{symbol}"
+        elif symbol.startswith(("0", "3")):
+            return f"sz.{symbol}"
+            
+    # 5. 其他情况尝试直接返回，或根据需求抛错
+    return symbol
 
 class HS300TimeSeriesDataset(Dataset):
     """
@@ -120,93 +149,102 @@ class HS300TimeSeriesDataset(Dataset):
 
         self.n_features = len(self.FEATURE_COLUMNS)
 
+    
     def _load_data(self, start_date: str, end_date: str, max_symbols: int):
-        try:
-            import baostock as bs
-        except ImportError as exc:
-            raise ImportError(
-                "HS300TimeSeriesDataset 需要安装 baostock，请运行 `pip install baostock`。"
-            ) from exc
+        # --- 修复日期格式 (兼容 YYYYMMDD 和 YYYY-MM-DD) ---
+        def fix_date(d):
+            d = d.replace("-", "").replace("/", "") # 先去掉可能存在的符号
+            if len(d) == 8:
+                return f"{d[:4]}-{d[4:6]}-{d[6:]}" # 强制转为 YYYY-MM-DD
+            return d # 如果格式很怪就不动了，让报错暴露问题
 
-        cache_file = self.cache_dir / f"hs300_{start_date}_{end_date}_{max_symbols}.pkl"
-        if cache_file.exists():
-            return pd.read_pickle(cache_file)
-
-        start_date_bs = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
-        end_date_bs = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
+        start_date = fix_date(start_date)
+        end_date = fix_date(end_date)
+        # ----------------------------------------------------
 
         lg = bs.login()
-        if lg.error_code != "0":
-            raise RuntimeError(f"Baostock 登录失败: {lg.error_msg}")
+        if lg.error_code != '0':
+            raise RuntimeError(f"Baostock login failed: {lg.error_msg}")
 
-        records = []
-        try:
-            comp_rs = bs.query_hs300_stocks(date=end_date_bs)
-            if comp_rs.error_code != "0":
-                raise RuntimeError(f"无法从 Baostock 获取沪深300成分股列表: {comp_rs.error_msg}")
-
-            codes = []
-            while comp_rs.next():
-                row = comp_rs.get_row_data()
-                if row and len(row) > 0:
-                    codes.append(row[0])  # e.g., "sh.600000"
-
-            for code in codes[:max_symbols]:
-                hist_rs = bs.query_history_k_data_plus(
-                    code,
-                    "date,code,open,high,low,close,volume,amount",
-                    start_date=start_date_bs,
-                    end_date=end_date_bs,
-                    frequency="d",
-                    adjustflag="2",  # 后复权
-                )
-
-                if hist_rs.error_code != "0":
-                    print(f"获取 {code} 数据失败: {hist_rs.error_msg}")
-                    continue
-
-                data_list = []
-                while hist_rs.next():
-                    data_list.append(hist_rs.get_row_data())
-
-                if not data_list:
-                    continue
-
-                df = pd.DataFrame(data_list, columns=hist_rs.fields)
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.sort_values("date").set_index("date")
-
-                rename_map = {
-                    "open": "open",
-                    "high": "high",
-                    "low": "low",
-                    "close": "close",
-                    "volume": "volume",
-                    "amount": "turnover",
-                }
-                df = df.rename(columns=rename_map)
-
-                numeric_cols = ["open", "close", "high", "low", "volume", "turnover"]
-                df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-                df = df.dropna(subset=numeric_cols)
-
-                df["return"] = df["close"].pct_change().fillna(0.0)
-                df["volume_change"] = df["volume"].pct_change().fillna(0.0)
-                df["volatility"] = df["return"].rolling(window=5, min_periods=1).std().fillna(0.0)
-                df["high_low_range"] = ((df["high"] - df["low"]) / df["close"].replace(0, np.nan)).fillna(0.0)
-                df["target"] = df["close"].pct_change().shift(-1)
-                df["symbol"] = code.replace(".", "")
-
-                feature_df = df[self.FEATURE_COLUMNS + ["target", "symbol"]].dropna(subset=["target"])
-                if feature_df.empty:
-                    continue
-
-                records.append(feature_df)
-        finally:
+        print(f"Baostock login success! Date range: {start_date} to {end_date}")
+        
+        cache_file = self.cache_dir / f"hs300_baostock_{start_date}_{end_date}_{max_symbols}.pkl"
+        if cache_file.exists():
+            print(f"Loading from cache: {cache_file}")
             bs.logout()
+            return pd.read_pickle(cache_file)
+
+        rs = bs.query_hs300_stocks()
+        if rs.error_code != '0':
+            raise RuntimeError("获取沪深300成分股失败")
+
+        hs300_codes = []
+        while rs.next():
+            row = rs.get_row_data()
+            hs300_codes.append(row[1])
+
+        print(f"获取到 {len(hs300_codes)} 只成分股，准备下载前 {max_symbols} 只...")
+        
+        records = []
+        for raw_code in hs300_codes[:max_symbols]:
+            code = _format_baostock_symbol(raw_code)
+            
+            rs_daily = bs.query_history_k_data_plus(
+                code,
+                "date,open,high,low,close,volume,amount,pctChg,turn",
+                start_date=start_date, 
+                end_date=end_date,
+                frequency="d", 
+                adjustflag="2"
+            )
+
+            # --- 修复 NoneType 报错 ---
+            if rs_daily is None or rs_daily.error_code != '0':
+                # 如果 rs_daily 是 None，说明参数严重错误（如日期格式）
+                msg = rs_daily.error_msg if rs_daily is not None else "Baostock returned None (Check date format)"
+                print(f"获取 {code} 失败: {msg}")
+                continue
+            # ------------------------
+
+            data_list = []
+            while rs_daily.next():
+                data_list.append(rs_daily.get_row_data())
+
+            if not data_list:
+                continue
+
+            df = pd.DataFrame(data_list, columns=rs_daily.fields)
+            
+            # 类型转换
+            numeric_cols = ["open", "high", "low", "close", "volume", "amount", "pctChg", "turn"]
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            rename_map = {
+                "amount": "turnover",
+                "pctChg": "pct_change",
+                "turn": "turnover_rate"
+            }
+            df = df.rename(columns=rename_map)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").set_index("date")
+            
+            df["return"] = df["close"].pct_change().fillna(0.0)
+            df["volume_change"] = df["volume"].pct_change().fillna(0.0)
+            df["volatility"] = df["return"].rolling(window=5, min_periods=1).std().fillna(0.0)
+            df["high_low_range"] = ((df["high"] - df["low"]) / df["close"].replace(0, np.nan)).fillna(0.0)
+            df["target"] = df["close"].pct_change().shift(-1)
+            df["symbol"] = code
+
+            feature_df = df[self.FEATURE_COLUMNS + ["target", "symbol"]].dropna(subset=["target"])
+            
+            if not feature_df.empty:
+                records.append(feature_df)
+
+        bs.logout()
 
         if not records:
-            raise RuntimeError("未能下载任何沪深300成分股数据，请检查网络或 Baostock 接口。")
+            raise RuntimeError("未能下载任何数据，请检查日期范围是否为非交易日，或网络问题。")
 
         combined = pd.concat(records, axis=0)
         combined.to_pickle(cache_file)
@@ -552,3 +590,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
