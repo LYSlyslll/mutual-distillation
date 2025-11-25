@@ -75,7 +75,7 @@ def _default_date_range(years: int = 3):
 
 class HS300TimeSeriesDataset(Dataset):
     """
-    从开源金融数据接口（akshare）抓取沪深300指数成分股日线数据，
+    从开源金融数据接口（Baostock）抓取沪深300指数成分股日线数据，
     构造时间序列监督学习数据集。
     """
 
@@ -122,83 +122,91 @@ class HS300TimeSeriesDataset(Dataset):
 
     def _load_data(self, start_date: str, end_date: str, max_symbols: int):
         try:
-            import akshare as ak
+            import baostock as bs
         except ImportError as exc:
             raise ImportError(
-                "HS300TimeSeriesDataset 需要安装 akshare，请运行 `pip install akshare`。"
+                "HS300TimeSeriesDataset 需要安装 baostock，请运行 `pip install baostock`。"
             ) from exc
 
         cache_file = self.cache_dir / f"hs300_{start_date}_{end_date}_{max_symbols}.pkl"
         if cache_file.exists():
             return pd.read_pickle(cache_file)
 
-        comp_df = ak.index_stock_cons(symbol="000300")
-        if "con_code" not in comp_df.columns:
-            raise RuntimeError("无法从 akshare 获取沪深300成分股列表。")
+        start_date_bs = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
+        end_date_bs = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
 
-        symbols = comp_df["con_code"].dropna().astype(str).head(max_symbols).tolist()
+        lg = bs.login()
+        if lg.error_code != "0":
+            raise RuntimeError(f"Baostock 登录失败: {lg.error_msg}")
+
         records = []
+        try:
+            comp_rs = bs.query_hs300_stocks(date=end_date_bs)
+            if comp_rs.error_code != "0":
+                raise RuntimeError(f"无法从 Baostock 获取沪深300成分股列表: {comp_rs.error_msg}")
 
-        for code in symbols:
-            formatted = _format_stock_symbol(code)
-            try:
-                df = ak.stock_zh_a_hist(
-                    symbol=formatted,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust="qfq",
+            codes = []
+            while comp_rs.next():
+                row = comp_rs.get_row_data()
+                if row and len(row) > 0:
+                    codes.append(row[0])  # e.g., "sh.600000"
+
+            for code in codes[:max_symbols]:
+                hist_rs = bs.query_history_k_data_plus(
+                    code,
+                    "date,code,open,high,low,close,volume,amount",
+                    start_date=start_date_bs,
+                    end_date=end_date_bs,
+                    frequency="d",
+                    adjustflag="2",  # 后复权
                 )
-            except Exception as err:  # noqa: BLE001
-                print(f"获取 {formatted} 数据失败: {err}")
-                continue
 
-            if df.empty:
-                continue
+                if hist_rs.error_code != "0":
+                    print(f"获取 {code} 数据失败: {hist_rs.error_msg}")
+                    continue
 
-            rename_map = {
-                "日期": "date",
-                "开盘": "open",
-                "收盘": "close",
-                "最高": "high",
-                "最低": "low",
-                "成交量": "volume",
-                "成交额": "turnover",
-                "涨跌幅": "pct_change",
-                "涨跌额": "change",
-                "换手率": "turnover_rate",
-                "振幅": "amplitude",
-            }
-            df = df.rename(columns=rename_map)
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date").set_index("date")
+                data_list = []
+                while hist_rs.next():
+                    data_list.append(hist_rs.get_row_data())
 
-            numeric_cols = [
-                "open",
-                "close",
-                "high",
-                "low",
-                "volume",
-                "turnover",
-            ]
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-            df = df.dropna(subset=numeric_cols)
+                if not data_list:
+                    continue
 
-            df["return"] = df["close"].pct_change().fillna(0.0)
-            df["volume_change"] = df["volume"].pct_change().fillna(0.0)
-            df["volatility"] = df["return"].rolling(window=5, min_periods=1).std().fillna(0.0)
-            df["high_low_range"] = ((df["high"] - df["low"]) / df["close"].replace(0, np.nan)).fillna(0.0)
-            df["target"] = df["close"].pct_change().shift(-1)
-            df["symbol"] = formatted
+                df = pd.DataFrame(data_list, columns=hist_rs.fields)
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date").set_index("date")
 
-            feature_df = df[self.FEATURE_COLUMNS + ["target", "symbol"]].dropna(subset=["target"])
-            if feature_df.empty:
-                continue
+                rename_map = {
+                    "open": "open",
+                    "high": "high",
+                    "low": "low",
+                    "close": "close",
+                    "volume": "volume",
+                    "amount": "turnover",
+                }
+                df = df.rename(columns=rename_map)
 
-            records.append(feature_df)
+                numeric_cols = ["open", "close", "high", "low", "volume", "turnover"]
+                df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+                df = df.dropna(subset=numeric_cols)
+
+                df["return"] = df["close"].pct_change().fillna(0.0)
+                df["volume_change"] = df["volume"].pct_change().fillna(0.0)
+                df["volatility"] = df["return"].rolling(window=5, min_periods=1).std().fillna(0.0)
+                df["high_low_range"] = ((df["high"] - df["low"]) / df["close"].replace(0, np.nan)).fillna(0.0)
+                df["target"] = df["close"].pct_change().shift(-1)
+                df["symbol"] = code.replace(".", "")
+
+                feature_df = df[self.FEATURE_COLUMNS + ["target", "symbol"]].dropna(subset=["target"])
+                if feature_df.empty:
+                    continue
+
+                records.append(feature_df)
+        finally:
+            bs.logout()
 
         if not records:
-            raise RuntimeError("未能下载任何沪深300成分股数据，请检查网络或 akshare 接口。")
+            raise RuntimeError("未能下载任何沪深300成分股数据，请检查网络或 Baostock 接口。")
 
         combined = pd.concat(records, axis=0)
         combined.to_pickle(cache_file)
